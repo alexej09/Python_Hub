@@ -1,0 +1,129 @@
+import os
+import pandas as pd
+from pathlib import Path
+import logging
+from tkinter import Tk
+from tkinter.filedialog import askopenfilename
+
+def setup_logging(log_file):
+    """
+    Konfiguriert das Logging-Modul.
+    """
+    logging.basicConfig(
+        filename=log_file,
+        filemode='w',
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logging.info("Logging gestartet.")
+
+
+def process_sheets(excel_path, output_path):
+    """
+    Liest alle Registerkarten (Sheets) aus einer Excel-Datei ein,
+    prüft, ob alle Sheets die gleiche Spaltenanzahl haben,
+    fügt sie zu einem DataFrame zusammen und schreibt das Ergebnis in eine neue Excel-Datei.
+    Gibt die erwartete Gesamtzeilenanzahl zurück.
+    Falls die Spaltenanzahl variiert, wird ein Fehler geloggt und das Skript abgebrochen.
+    """
+    try:
+        xl = pd.ExcelFile(excel_path)
+        sheet_names = xl.sheet_names
+        logging.info(f"Gefundene Sheets in '{excel_path.name}': {sheet_names}")
+    except Exception as e:
+        logging.error(f"Fehler beim Öffnen der Excel-Datei {excel_path.name}: {e}")
+        return 0
+
+    output_df = pd.DataFrame()
+    expected_rows = 0
+    output_line_counter = 1
+
+    reference_cols = []
+
+    for idx, sheet in enumerate(sheet_names):
+        try:
+            df = xl.parse(sheet)
+            num_rows, num_cols = df.shape
+            logging.info(f"Sheet: {sheet}, Zeilen: {num_rows}, Spalten: {num_cols}")
+
+            # Referenz-Spaltennamen und -anzahl beim ersten Sheet festlegen
+            if idx == 0:
+                reference_cols = list(df.columns)
+                num_ref_cols = len(reference_cols)
+                logging.info(f"Referenz-Spalten ({num_ref_cols}) aus erstem Sheet '{sheet}': {reference_cols}")
+
+            # Prüfen der Spaltenanzahl bei allen Sheets
+            if len(reference_cols) != num_cols:
+                error_msg = (
+                    f"Sheet '{sheet}' hat {num_cols} Spalten, erwartet {len(reference_cols)}. Abbruch.")
+                logging.error(error_msg)
+                print(error_msg)
+                return 0
+
+            expected_rows += num_rows
+
+            # DataFrame für diesen Sheet-Aufbau: neue Spalte + generische Spaltennamen
+            df_output = pd.DataFrame()
+            df_output['Sheetname'] = [sheet] * num_rows
+            for i, col_name in enumerate(reference_cols):
+                df_output[col_name] = df.iloc[:, i]
+
+            first_line = output_line_counter
+            last_line = output_line_counter + num_rows - 1
+            logging.info(
+                f"Sheet '{sheet}': Zeilen 1–{num_rows} nach Output-Zeile {first_line}–{last_line} übertragen."
+            )
+
+            output_df = pd.concat([output_df, df_output], ignore_index=True)
+            output_line_counter += num_rows
+
+        except Exception as e:
+            logging.error(f"Fehler beim Verarbeiten des Sheets '{sheet}': {e}")
+            print(f"Fehler beim Verarbeiten des Sheets '{sheet}'. Details siehe logfile.")
+            return 0
+
+    try:
+        output_df.to_excel(output_path, index=False)
+        logging.info(f"Alle Daten erfolgreich in '{output_path.name}' geschrieben.")
+    except Exception as e:
+        logging.error(f"Fehler beim Schreiben der Outputdatei: {e}")
+        print("Fehler beim Schreiben der Outputdatei. Details siehe logfile.")
+        return 0
+
+    return expected_rows
+
+
+def main():
+    # Verzeichnis des Skripts
+    script_dir = Path(__file__).parent.resolve()
+    log_file = script_dir / "logfile.log"
+
+    # Logging initialisieren
+    setup_logging(log_file)
+
+    # Dialog zur Auswahl der Input-Datei
+    root = Tk()
+    root.withdraw()  # Hauptfenster ausblenden
+    file_path = askopenfilename(
+        title="Wähle eine Excel-Datei",
+        filetypes=[("Excel Dateien", "*.xlsx *.xls")]
+    )
+    if not file_path:
+        logging.error("Keine Datei ausgewählt.")
+        print("Keine Datei ausgewählt. Skript beendet.")
+        return
+
+    input_file = Path(file_path)
+    output_file = script_dir / "Outputdatei.xlsx"
+
+    # Verarbeitung
+    expected = process_sheets(input_file, output_file)
+    if expected > 0:
+        logging.info(f"Erwartete Gesamtzeilenanzahl: {expected}")
+        logging.info("Skript erfolgreich beendet.")
+    else:
+        logging.info("Skript mit Fehler beendet.")
+
+
+if __name__ == "__main__":
+    main()
