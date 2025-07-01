@@ -1,0 +1,104 @@
+import os
+import pandas as pd
+from pathlib import Path
+import logging
+import tkinter as tk
+from tkinter import filedialog
+
+def setup_logging(log_file):
+    """
+    Konfiguriert das Logging-Modul.
+    """
+    logging.basicConfig(
+        filename=log_file,
+        filemode='w',
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logging.info("Logging gestartet.")
+
+def process_files(input_files, output_path):
+    """
+    Verarbeitet jede Inputdatei und schreibt die Daten in die Outputdatei.
+    Gibt die erwartete Anzahl der Zeilen zurück.
+    Zusätzlich werden die Zeilennummern der ersten und letzten Zeile jeder Eingabedatei protokolliert.
+    """
+    output_df = pd.DataFrame()
+    expected_rows = 0
+    output_line_counter = 1
+
+    for file in input_files:
+        try:
+            # Einlesen der ersten Tabelle
+            xl = pd.ExcelFile(file)
+            sheet_name = xl.sheet_names[0]
+            df = xl.parse(sheet_name)
+
+            num_rows, num_cols = df.shape
+            logging.info(f"Datei: {file.name}, Registerkarte: {sheet_name}, Zeilen: {num_rows}, Spalten: {num_cols}")
+
+            expected_rows += num_rows
+
+            # Aufbau des Ausgabedatenrahmens mit FileName statt Sheetname
+            df_output = pd.DataFrame()
+            df_output['FileName'] = [file.stem] * num_rows
+            df_output['Erste Spalte'] = df.iloc[:, 0]
+            for col in df.columns[1:]:
+                df_output[col] = df[col]
+
+            first_line_in_output = output_line_counter
+            last_line_in_output = output_line_counter + num_rows - 1
+            logging.info(
+                f"Input Datei '{file.name}': Input Zeile 1 in Output Zeile {first_line_in_output} übertragen, "
+                f"letzte Zeile des Inputs (Zeile {num_rows}) in Output Zeile {last_line_in_output} übertragen."
+            )
+
+            output_df = pd.concat([output_df, df_output], ignore_index=True)
+            output_line_counter += num_rows
+
+        except Exception as e:
+            logging.error(f"Fehler beim Verarbeiten der Datei {file.name}: {e}")
+
+    try:
+        output_df.to_excel(output_path, index=False)
+        logging.info(f"Alle Daten erfolgreich in {output_path.name} übertragen.")
+    except Exception as e:
+        logging.error(f"Fehler beim Schreiben der Outputdatei: {e}")
+
+    return expected_rows
+
+def main():
+    # Pfade für Output- und Logdateien (im Verzeichnis des Skripts)
+    script_dir = Path(__file__).parent.resolve()
+    output_file = script_dir / "Outputdatei.xlsx"
+    log_file = script_dir / "logfile.log"
+
+    # Setup Logging
+    setup_logging(log_file)
+
+    # Öffne Dialog zur Dateiauswahl
+    root = tk.Tk()
+    root.withdraw()
+    file_paths = filedialog.askopenfilenames(
+        title="Wähle die Excel-Dateien zum Zusammenfassen",
+        filetypes=[("Excel Dateien", "*.xlsx")]
+    )
+
+    if not file_paths:
+        logging.error("Keine Dateien ausgewählt. Skript wird beendet.")
+        print("Fehler: Keine Dateien ausgewählt. Das Skript wird beendet.")
+        return
+
+    input_files = [Path(fp) for fp in file_paths]
+    input_files.sort(key=lambda x: int(''.join(filter(str.isdigit, x.stem)) or 0))
+    logging.info(f"Ausgewählte und sortierte Dateien: {[f.name for f in input_files]}")
+
+    expected_rows = process_files(input_files, output_file)
+
+    logging.info(f"Erwartete Gesamtzeilenanzahl in der Outputdatei: {expected_rows}")
+    logging.info("Skript erfolgreich beendet.")
+
+    print(f"Fertig! Insgesamt {expected_rows} Zeilen in {output_file.name} geschrieben.")
+
+if __name__ == "__main__":
+    main()
