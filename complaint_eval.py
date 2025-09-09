@@ -1,225 +1,398 @@
-import json
-import logging
-import os
-import re
-from typing import Any, Dict, List, Tuple, Optional
-import ollama
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Enhanced JSON row enricher for Ollama/Mistral (V2 - Refactored)
 
-# =========================
-# KONFIGURATION
-# =========================
-file_path = r"C:\Users\bernh\Documents\Job\Forschung\AI_Complaint\ETQ_Filtered.json"
-model_name = "qwen3:8b"
+Reads JSON input (either a flat list of row-objects OR the nested Excel-export
+structure: sheets -> <sheet> -> excel_tables[0] -> {headers, rows}).
 
-# Der Prompt füllt nur Felder, die leer sind oder "to be filled" enthalten.
-# Erhält die übrigen Werte unverändert.
-prompt_template = """Du bist ein hilfreiches System. Du erhältst eine Tabellenzeile als JSON.
-AUFGABE:
-- Fülle NUR die Felder aus, deren Wert leer ist ("" oder null) oder exakt "to be filled" lautet.
-- Nutze ausschließlich die vorhandenen Informationen aus der Zeile (keine Halluzinationen).
-- Antworte mit einem kompakten JSON-Objekt, das NUR die geänderten/ausgefüllten Schlüssel-Wert-Paare enthält.
-- Wenn nichts sinnvoll ausfüllbar ist, antworte mit "{}".
-- KEIN Fließtext, KEINE Erklärungen, NUR JSON.
+For each input row, the script:
+  1) Calls a local Mistral model via Ollama and asks four focused questions.
+     Instead of a naive retry, it parses answers more flexibly.
+  2) Adds NEW columns with model-generated entries ONLY for those new fields:
+       - "Issue related to breakage?" (Yes/No)
+       - "Issue related to ceramic tip?" (Yes/No)
+       - "When was the issue detected?" (one of fixed labels)
+       - "Type of Patient-Harm?" (one of fixed labels)
+       - "Summary" (2–4 sentences, includes verbatim quotes w/ [Column=...])
+     Existing/original columns and their headers are copied from the input and
+     are NOT produced by the model. Their order is preserved.
+  3) Logs one single-sentence per row summarizing the answers and whether a
+     response could be generated (logging keywords only: INFO, WARNING, ERROR).
 
-Hier ist die Zeile:
-{row_data}
+Output is ALWAYS a single JSON object mirroring the input structure (no JSONL).
+
+USAGE EXAMPLE:
+    python mistral_ollama_json_enricher_v2.py \
+        --input C:/path/TEST.json \
+        --out C:/path/Output.json \
+        --model mistral:7b-instruct
+
+Requirements:
+    - Python 3.9+
+    - requests (pip install requests)
+    - Ollama running locally (default http://localhost:11434) with a Mistral
+      instruct model available, e.g. `ollama pull mistral:7b-instruct`
 """
 
-# Logging
-log_file = 'processing_detect.log'
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
+from __future__ import annotations
+
+# =============================
+# >>> USER-CONFIGURABLE SETTINGS (CLEARLY MARKED) <<<
+# Adjust these to your needs. Keep model temperature very low for repeatability.
+# =============================
+DEFAULT_INPUT_PATH = r"C:\Users\Alex.bernhard\OneDrive - Olympus\Organisatorisches\KI_Projekte\Complaint_Analysis\TEST.json"
+DEFAULT_OUTPUT_PATH = r"C:\Users\Alex.bernhard\OneDrive - Olympus\Organisatorisches\KI_Projekte\Complaint_Analysis\Output.json"
+
+# Ollama / Model settings
+OLLAMA_HOST = "http://localhost:11434"
+OLLAMA_MODEL = "mistral:7b-instruct"   # e.g., "mistral", "mistral:7b-instruct"
+TEMPERATURE = 0.0                      # very low for reproducibility
+NUM_PREDICT = 128                      # per question; raise if answers get cut
+TIMEOUT_SEC = 120.0
+REQUEST_DELAY_SEC = 1.0                # optional sleep between requests for each ROW
+
+# Label sets (kept strict to force exact labels & quotes)
+STRICT_YESNO = ("Yes", "No")
+DETECTED_LABELS = (
+    "During Inspection",
+    "During Operation",
+    "During Reprocessing",
+    "During Service Activities",
+    "During follow-up Examination of Patient",
+)
+PATIENT_HARM_LABELS = (
+    "Bleeding or other severe damage",
+    "Delay of Surgery",
+    "none",
 )
 
-# =========================
-# HILFSFUNKTIONEN
-# =========================
-def extract_json_snippet(text: str) -> Optional[str]:
-    """
-    Versucht, das erste valide JSON-Objekt aus einem Text zu extrahieren.
-    """
-    if not isinstance(text, str):
+# The NEW columns to be added to each row (keys must match desired headers):
+NEW_COLUMNS = [
+    "Issue related to breakage?",
+    "Issue related to ceramic tip?",
+    "When was the issue detected?",
+    "Type of Patient-Harm?",
+    "Summary",
+]
+# =============================
+
+import argparse
+import json
+import logging
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+from collections import OrderedDict
+
+import requests
+
+# -----------------------------
+# Logging: only plain keywords INFO/WARNING/ERROR, single-sentence per row.
+# -----------------------------
+logger = logging.getLogger("enricher")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter("%(levelname)s %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# -----------------------------
+# Input loader: supports flat list or nested Excel-export structure.
+# -----------------------------
+
+def load_rows_from_json(json_path: Path) -> Tuple[List[Dict[str, Any]], Optional[List[str]], Any]:
+    """Loads rows and headers from JSON, returning the original data structure as well."""
+    try:
+        original_data = json.loads(json_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        logger.error(f"Input file not found: {json_path}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in input file: {e}")
+        sys.exit(1)
+
+    rows: List[Dict[str, Any]] = []
+    headers: Optional[List[str]] = None
+
+    # Case A: direct list of objects
+    if isinstance(original_data, list):
+        if original_data and isinstance(original_data[0], dict):
+            rows = original_data
+            headers = list(rows[0].keys()) # Preserve original header order
+            return rows, headers, original_data
+        raise ValueError("JSON list found, but does not contain objects.")
+
+    # Case B: nested Excel structure
+    if not isinstance(original_data, dict):
+        raise ValueError("Unexpected JSON: neither dict nor list.")
+
+    sheets = original_data.get("sheets", {})
+    if sheets:
+        if len(sheets) > 1:
+            logger.warning(f"Found {len(sheets)} sheets; only processing the first one.")
+        
+        first_sheet = next(iter(sheets.values()), None)
+        if not first_sheet:
+            raise ValueError("Found 'sheets' but it is empty.")
+
+        tables = first_sheet.get("excel_tables", [])
+        if not tables:
+            raise ValueError("Missing 'excel_tables' in first sheet.")
+        
+        table0 = tables[0]
+        rows = table0.get("rows", [])
+        headers = table0.get("headers", None)
+        
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("No rows found in 'rows'.")
+        
+        # Fallback to infer headers from the first row if not explicitly provided
+        if headers is None and isinstance(rows[0], dict):
+            headers = list(rows[0].keys())
+        
+        return rows, headers, original_data
+
+    raise ValueError("Cannot detect supported structure (no list and no 'sheets').")
+
+# -----------------------------
+# Ollama chat helper
+# -----------------------------
+
+def call_ollama_chat(
+    model: str,
+    messages: List[Dict[str, str]],
+    host: str = OLLAMA_HOST,
+    temperature: float = TEMPERATURE,
+    num_predict: int = NUM_PREDICT,
+    timeout: float = TIMEOUT_SEC,
+) -> Optional[str]:
+    """Calls the Ollama chat API and returns the content or None on error."""
+    url = f"{host.rstrip('/')}/api/chat"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": temperature, "num_predict": num_predict},
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data.get("message", {}).get("content", "")
+        return (content or "").strip()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Ollama API request failed: {e}")
         return None
-    # Schneller Treffer: beginnt/endet wie JSON
-    text = text.strip()
-    if text.startswith("{") and text.endswith("}"):
-        try:
-            json.loads(text)
-            return text
-        except Exception:
-            pass
-    # Fallback: suche das erste {...} mit rudimentärem Klammerzähler
-    stack = 0
-    start = -1
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if stack == 0:
-                start = i
-            stack += 1
-        elif ch == "}":
-            if stack > 0:
-                stack -= 1
-                if stack == 0 and start != -1:
-                    candidate = text[start:i+1]
-                    try:
-                        json.loads(candidate)
-                        return candidate
-                    except Exception:
-                        # weiter suchen
-                        start = -1
-                        continue
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during API call: {e}")
+        return None
+
+# -----------------------------
+# System and User Prompts
+# -----------------------------
+
+SYSTEM_PROMPT = (
+    "You are a precise, bilingual data assistant working on single table rows. "
+    "Only output what is requested. Keep outputs minimal, English-only, and deterministic."
+)
+
+def prompt_yesno_breakage(row_json: str) -> str:
+    return f"""Task: Decide if the issue is related to breakage based on the row content.
+Allowed answers: Yes or No. Output exactly one word: Yes or No.
+Evidence is in this JSON row. Consider fields such as 'H6 Medical Device Problem Code', 'Event Description', 'Evaluation Result', 'Investigation Conclusion' and related text.
+Row JSON:
+{row_json}"""
+
+def prompt_yesno_ceramic(row_json: str) -> str:
+    return f"""Task: Decide if the issue is related to the ceramic tip based on the row content.
+Search for explicit mentions and close synonyms like ceramic tip, ceramic beak, tip, beak, or phrasing indicating ceramic-part damage.
+Allowed answers: Yes or No. Output exactly one word: Yes or No.
+Row JSON:
+{row_json}"""
+
+def prompt_detected_when(row_json: str) -> str:
+    labels = " | ".join(DETECTED_LABELS)
+    return f"""Task: Classify WHEN the issue was detected based on the row content.
+Choose exactly ONE of these labels and output it verbatim (no extra text):
+{labels}
+Hints: before the operation -> During Inspection; intraoperative -> During Operation; found during cleaning/sterilization -> During Reprocessing; service scenarios -> During Service Activities; later follow-up of the patient -> During follow-up Examination of Patient.
+Row JSON:
+{row_json}"""
+
+def prompt_patient_harm(row_json: str) -> str:
+    labels = " | ".join(PATIENT_HARM_LABELS)
+    return f"""Task: Classify the type of patient harm based on the row content.
+Choose exactly ONE of these labels and output it verbatim (no extra text):
+{labels}
+Instructions:
+1.  **Actively search for evidence** of patient harm. Focus your analysis on text fields like 'Event Description', 'H6 Health Effect Impact Code', and 'H6 Health Effect Clinical Code'.
+2.  Look for explicit keywords and descriptions indicating injury, such as "bleeding", "laceration", "complication", "adverse event", "extended surgery", or "unintended tissue damage".
+If there is no indication of patient injury, choose 'none'.
+Row JSON:
+{row_json}"""
+
+def prompt_summary(row_json: str, ans_breakage: str, ans_ceramic: str, ans_detected: str, ans_harm: str) -> str:
+    return f"""Write a concise English summary (2–4 sentences) JUSTIFYING the four answers.
+Requirements:
+- Quote short, verbatim snippets from the row using double quotes, and after each quote add a source marker like [Column=Event Description].
+- Explicitly mention WHICH column each piece of evidence was found in.
+- When relevant fields are empty/unknown, state 'not specified'.
+- Focus only on evidence supporting: breakage, ceramic tip relation, detection timing, patient harm.
+- Output plain text (no markdown).
+Given answers: breakage={ans_breakage}; ceramic_tip={ans_ceramic}; detected={ans_detected}; harm={ans_harm}.
+Row JSON:
+{row_json}"""
+
+# -----------------------------
+# Helper Functions
+# -----------------------------
+
+def reorder_row(row: Dict[str, Any], headers_list: List[str]) -> OrderedDict:
+    """Return row as OrderedDict with keys exactly in headers_list order."""
+    return OrderedDict((h, row.get(h, "")) for h in headers_list)
+
+def _parse_flexible_answer(raw_answer: Optional[str], valid_labels: Tuple[str, ...]) -> Optional[str]:
+    """Finds the first valid label in a raw string, case-insensitive."""
+    if not raw_answer:
+        return None
+    
+    # First, try for an exact match (most common case)
+    if raw_answer in valid_labels:
+        return raw_answer
+        
+    # If no exact match, search for the label within the string
+    lower_answer = raw_answer.lower()
+    for label in valid_labels:
+        if label.lower() in lower_answer:
+            return label # Return the original, correctly-cased label
     return None
 
-def find_row_lists(data: Any) -> List[Tuple[List[str], List[Dict[str, Any]], Dict[str, Any]]]:
-    """
-    Durchsucht rekursiv das geladene JSON-Objekt nach Listen von Zeilen (List[Dict]).
-    Gibt eine Liste von Tripeln zurück:
-      (pfad, rows_ref, parent_obj)
-    - pfad: Liste der Keys, wie man zur rows-Liste kommt (nur zur Info/Logging).
-    - rows_ref: die tatsächlich gefundene Referenz auf die rows-Liste (List[Dict]).
-    - parent_obj: das Objekt, das das Feld 'rows' enthält (z.B. die Excel-Tabelle), damit wir später ersetzen können.
-    Heuristik: Wir suchen Keys namens "rows" deren Wert eine Liste von Dictionaries ist.
-    """
-    results: List[Tuple[List[str], List[Dict[str, Any]], Dict[str, Any]]] = []
+def _ask_and_validate_question(
+    prompt_func, *args, 
+    valid_labels: Optional[Tuple[str, ...]] = None,
+    is_summary: bool = False
+) -> Tuple[str, bool]:
+    """Helper to ask a question, parse the answer, and return value and validity."""
+    question_text = prompt_func(*args)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": question_text}]
+    
+    raw_answer = call_ollama_chat(
+        model=cli_args.model, messages=messages, host=cli_args.host,
+        temperature=cli_args.temperature, num_predict=cli_args.num_predict, timeout=cli_args.timeout
+    )
 
-    def _walk(obj: Any, path: List[str]):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                new_path = path + [k]
-                # Kandidat: rows
-                if k.lower() == "rows" and isinstance(v, list) and (len(v) == 0 or isinstance(v[0], dict)):
-                    results.append((new_path, v, obj))
-                # weiter tiefer suchen
-                _walk(v, new_path)
-        elif isinstance(obj, list):
-            for idx, item in enumerate(obj):
-                _walk(item, path + [f"[{idx}]"])
+    if raw_answer is None: # API call failed
+        return "", False
 
-    _walk(data, [])
-    return results
+    if is_summary:
+        return raw_answer, bool(raw_answer)
 
-def should_fill_value(val: Any) -> bool:
-    """
-    Entscheidet, ob ein Feld auszufüllen ist.
-    - None, "", "to be filled" (case-insensitive, whitespace tolerant)
-    """
-    if val is None:
-        return True
-    if isinstance(val, str):
-        if val.strip() == "" or val.strip().lower() == "to be filled":
-            return True
-    return False
+    # For classification questions, parse flexibly
+    parsed_answer = _parse_flexible_answer(raw_answer, valid_labels)
+    if parsed_answer:
+        return parsed_answer, True
+    else:
+        logger.warning(f"Could not parse valid label from model output: '{raw_answer}'")
+        return raw_answer, False
 
-def build_minimal_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Liefert ein Subset der Zeile, das nur die potenziell zu füllenden Felder enthält.
-    (Optional – der Prompt funktioniert auch mit der vollen Zeile. Das Subset macht es dem Modell leichter.)
-    """
-    return {k: v for k, v in row.items() if should_fill_value(v)}
+# -----------------------------
+# Main processing
+# -----------------------------
 
-def merge_updates_into_row(row: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Fügt die vom LLM gelieferten Updates in die Originalzeile ein (in-place).
-    """
-    for k, v in updates.items():
-        # Nur überschreiben, wenn das Feld tatsächlich ausfüllbar war – schützt vor unerwünschten Änderungen
-        if k in row and should_fill_value(row[k]):
-            row[k] = v
-    return row
+cli_args: argparse.Namespace = None # Global placeholder for command-line arguments
 
-# =========================
-# HAUPTLOGIK
-# =========================
-def process_file(file_path: str, model_name: str, prompt_template: str):
-    logging.info(f"Starte Verarbeitung. Lade Datei: {file_path}")
-    if not os.path.exists(file_path):
-        print(f"❌ FEHLER: Datei nicht gefunden: {file_path}")
-        return
+def main() -> None:
+    global cli_args
+    ap = argparse.ArgumentParser(description="Enrich JSON rows with model-derived fields using Ollama/Mistral.")
+    ap.add_argument("--input", "-i", type=Path, default=Path(DEFAULT_INPUT_PATH), help="Path to input JSON file")
+    ap.add_argument("--out", "-o", type=Path, default=Path(DEFAULT_OUTPUT_PATH), help="Path to output JSON")
+    ap.add_argument("--model", "-m", type=str, default=OLLAMA_MODEL, help="Ollama model name")
+    ap.add_argument("--host", type=str, default=OLLAMA_HOST, help="Ollama host, e.g. http://localhost:11434")
+    ap.add_argument("--temperature", type=float, default=TEMPERATURE, help="Sampling temperature (keep low)")
+    ap.add_argument("--num_predict", type=int, default=NUM_PREDICT, help="Max tokens per answer")
+    ap.add_argument("--timeout", type=float, default=TIMEOUT_SEC, help="HTTP timeout seconds")
+    ap.add_argument("--delay", type=float, default=REQUEST_DELAY_SEC, help="Optional delay between processed rows")
+    cli_args = ap.parse_args()
 
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        logging.info("Datei erfolgreich geladen.")
-    except json.JSONDecodeError as e:
-        print(f"❌ FEHLER: Ungültiges JSON: {e}")
-        return
-    except Exception as e:
-        print(f"❌ FEHLER beim Lesen: {e}")
-        return
+        rows, headers, original_data = load_rows_from_json(cli_args.input)
+    except ValueError as e:
+        logger.error(f"Failed to load or parse input file: {e}")
+        sys.exit(1)
 
-    # Finde alle rows-Listen
-    row_lists = find_row_lists(data)
-    if not row_lists:
-        logging.error("Keine rows-Listen gefunden. Prüfe Struktur.")
-        print("❌ FEHLER: Konnte keine 'rows' Listen in der JSON-Struktur finden.")
-        return
+    logger.info(f"Loaded {len(rows)} rows to process.")
+    enriched_rows: List[Dict[str, Any]] = []
 
-    logging.info(f"{len(row_lists)} rows-Listen gefunden.")
-    total_rows = sum(len(rows) for _, rows, _ in row_lists)
-    print(f"✅ Struktur erkannt. Gefundene Tabellen: {len(row_lists)} • Gesamtzeilen: {total_rows}")
+    for idx, row in enumerate(rows, start=1):
+        row_json = json.dumps(row, ensure_ascii=False, indent=2)
 
-    processed_count = 0
-    skipped_count = 0
+        ans_breakage, valid_breakage = _ask_and_validate_question(prompt_yesno_breakage, row_json, valid_labels=STRICT_YESNO)
+        ans_ceramic, valid_ceramic = _ask_and_validate_question(prompt_yesno_ceramic, row_json, valid_labels=STRICT_YESNO)
+        ans_detected, valid_detected = _ask_and_validate_question(prompt_detected_when, row_json, valid_labels=DETECTED_LABELS)
+        ans_harm, valid_harm = _ask_and_validate_question(prompt_patient_harm, row_json, valid_labels=PATIENT_HARM_LABELS)
+        
+        # Pass the (potentially invalid) answers to summary to give it context
+        summary_text, valid_summary = _ask_and_validate_question(
+            prompt_summary, row_json, ans_breakage, ans_ceramic, ans_detected, ans_harm, is_summary=True
+        )
 
-    for path, rows, parent in row_lists:
-        path_str = " → ".join(path)
-        logging.info(f"Verarbeite rows unter Pfad: {path_str} (Anzahl: {len(rows)})")
-        print(f"\n🔹 Tabelle: {path_str} (Zeilen: {len(rows)})")
+        out_row = dict(row)
+        out_row["Issue related to breakage?"] = ans_breakage if valid_breakage else ""
+        out_row["Issue related to ceramic tip?"] = ans_ceramic if valid_ceramic else ""
+        out_row["When was the issue detected?"] = ans_detected if valid_detected else ""
+        out_row["Type of Patient-Harm?"] = ans_harm if valid_harm else ""
+        out_row["Summary"] = summary_text if valid_summary else ""
+        enriched_rows.append(out_row)
 
-        for i, row in enumerate(rows, start=1):
-            # Prüfe, ob überhaupt etwas zu füllen ist
-            fill_targets = build_minimal_row(row)
-            if not fill_targets:
-                skipped_count += 1
-                if i % 100 == 0 or i == 1:
-                    print(f"  • Zeile {i}: nichts zu füllen — übersprungen")
-                continue
+        status_parts = [
+            f"breakage={'ok' if valid_breakage else 'fail'}",
+            f"ceramic={'ok' if valid_ceramic else 'fail'}",
+            f"detected={'ok' if valid_detected else 'fail'}",
+            f"harm={'ok' if valid_harm else 'fail'}",
+            f"summary={'ok' if valid_summary else 'fail'}",
+        ]
+        all_valid = all([valid_breakage, valid_ceramic, valid_detected, valid_harm, valid_summary])
+        logger.log(logging.INFO if all_valid else logging.WARNING, f"Row {idx}: " + ", ".join(status_parts))
 
-            try:
-                full_prompt = prompt_template.format(row_data=json.dumps(row, ensure_ascii=False))
-                response = ollama.chat(
-                    model=model_name,
-                    messages=[{"role": "user", "content": full_prompt}],
-                    format="json"  # Modell soll JSON liefern
-                )
-                content = response["message"]["content"]
-                snippet = extract_json_snippet(content)
-                if not snippet:
-                    raise ValueError("Konnte kein valides JSON in der Modellantwort finden.")
+        if cli_args.delay > 0:
+            time.sleep(cli_args.delay)
 
-                updates = json.loads(snippet)
-                if not isinstance(updates, dict):
-                    raise ValueError("Modellantwort ist kein JSON-Objekt.")
+    # --- Preserve original outer structure and write output ---
+    output_obj: Any
+    if isinstance(original_data, dict) and "sheets" in original_data:
+        output_obj = original_data
+        first_sheet_key = next(iter(output_obj["sheets"].keys()))
+        table0 = output_obj["sheets"][first_sheet_key]["excel_tables"][0]
+        
+        headers_list = table0.get("headers") or (list(headers) if headers else [])
+        for col in NEW_COLUMNS:
+            if col not in headers_list:
+                headers_list.append(col)
+        table0["headers"] = headers_list
+        table0["rows"] = [reorder_row(r, headers_list) for r in enriched_rows]
 
-                merge_updates_into_row(row, updates)
-                processed_count += 1
-
-                if i % 50 == 0 or i == 1:
-                    print(f"  ✅ Zeile {i}: aktualisiert (Felder: {', '.join(updates.keys()) if updates else '—'})")
-
-            except Exception as e:
-                logging.error(f"Fehler in Zeile {i} @ {path_str}: {e}")
-                print(f"  ⚠️ Zeile {i}: Fehler bei der Verarbeitung — Original beibehalten. ({e})")
-                skipped_count += 1
-                continue
-
-    # Ausgabe speichern – gleiche Struktur, nur rows wurden aktualisiert
-    directory = os.path.dirname(file_path)
-    base = os.path.basename(file_path)
-    name, ext = os.path.splitext(base)
-    out_path = os.path.join(directory, f"{name}_filled{ext if ext else '.json'}")
+    elif isinstance(original_data, list):
+        # BUG FIX: Use the original headers, not inferred ones from the enriched row
+        final_headers = (headers or []) + [col for col in NEW_COLUMNS if col not in (headers or [])]
+        output_obj = [reorder_row(r, final_headers) for r in enriched_rows]
+    else:
+        output_obj = enriched_rows # Fallback
 
     try:
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        logging.info(f"Fertig. Ausgabedatei: {out_path}")
-        print(f"\n🎉 Fertig! Aktualisierte Datei gespeichert unter:\n{out_path}")
-        print(f"   Aktualisierte Zeilen: {processed_count} • Übersprungen/Fehler: {skipped_count}")
+        Path(cli_args.out).write_text(
+            json.dumps(output_obj, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info(f"Wrote output with preserved structure to {cli_args.out}")
     except Exception as e:
-        logging.error(f"Ausgabedatei konnte nicht gespeichert werden: {e}")
-        print(f"❌ FEHLER beim Speichern: {e}")
+        logger.error(f"Failed to write output file: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    process_file(file_path, model_name, prompt_template)
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.warning("Aborted by user")
+        sys.exit(130)
