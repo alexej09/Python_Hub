@@ -1,38 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Enhanced JSON row enricher for Ollama/Mistral (V2 - Refactored)
+Enhanced JSON row enricher for Ollama/Mistral (V2 - Refactored + Logging & Perf Monitor)
 
-Reads JSON input (either a flat list of row-objects OR the nested Excel-export
-structure: sheets -> <sheet> -> excel_tables[0] -> {headers, rows}).
-
-For each input row, the script:
-  1) Calls a local Mistral model via Ollama and asks four focused questions.
-     Instead of a naive retry, it parses answers more flexibly.
-  2) Adds NEW columns with model-generated entries ONLY for those new fields:
-       - "Issue related to breakage?" (Yes/No)
-       - "Issue related to ceramic tip?" (Yes/No)
-       - "When was the issue detected?" (one of fixed labels)
-       - "Type of Patient-Harm?" (one of fixed labels)
-       - "Summary" (2–4 sentences, includes verbatim quotes w/ [Column=...])
-     Existing/original columns and their headers are copied from the input and
-     are NOT produced by the model. Their order is preserved.
-  3) Logs one single-sentence per row summarizing the answers and whether a
-     response could be generated (logging keywords only: INFO, WARNING, ERROR).
-
-Output is ALWAYS a single JSON object mirroring the input structure (no JSONL).
-
-USAGE EXAMPLE:
-    python mistral_ollama_json_enricher_v2.py \
-        --input C:/path/TEST.json \
-        --out C:/path/Output.json \
-        --model mistral:7b-instruct
+- Liest JSON (flat oder Excel-Export-Struktur).
+- Fragt pro Row vier Klassifikationen + Summary bei lokaler Ollama/Mistral-Instanz ab.
+- Ergänzt neue Spalten und erhält Originalstruktur.
+- Schreibt ausführliches Log (Konsole + Datei) mit Zeitstempeln, Modell- & Systeminfos,
+  Performance-Zeitreihe (CPU/RAM/GPU, wenn verfügbar), Laufzeiten pro Row und Gesamtzeit.
 
 Requirements:
     - Python 3.9+
-    - requests (pip install requests)
-    - Ollama running locally (default http://localhost:11434) with a Mistral
-      instruct model available, e.g. `ollama pull mistral:7b-instruct`
+    - requests
+    - (optional) psutil für CPU/RAM-Infos
+    - (optional) pynvml für NVIDIA-GPU-Infos
+    - Ollama (http://localhost:11434) + passendes Mistral-Instruct-Modell
 """
 
 from __future__ import annotations
@@ -41,8 +23,10 @@ from __future__ import annotations
 # >>> USER-CONFIGURABLE SETTINGS (CLEARLY MARKED) <<<
 # Adjust these to your needs. Keep model temperature very low for repeatability.
 # =============================
-DEFAULT_INPUT_PATH = r"C:\Users\Alex.bernhard\OneDrive - Olympus\Organisatorisches\KI_Projekte\Complaint_Analysis\TEST.json"
+DEFAULT_INPUT_PATH = r"C:\Users\Alex.bernhard\OneDrive - Olympus\Organisatorisches\KI_Projekte\Complaint_Analysis\ETQ_Filtered.json"
 DEFAULT_OUTPUT_PATH = r"C:\Users\Alex.bernhard\OneDrive - Olympus\Organisatorisches\KI_Projekte\Complaint_Analysis\Output.json"
+DEFAULT_LOG_PATH = r"C:\Users\Alex.bernhard\OneDrive - Olympus\Organisatorisches\KI_Projekte\Complaint_Analysis\run.log"
+PERF_SAMPLING_SEC = 600.0  # Intervall für CPU/RAM/GPU-Samples
 
 # Ollama / Model settings
 OLLAMA_HOST = "http://localhost:11434"
@@ -85,18 +69,184 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from collections import OrderedDict
+import os
+import platform
+import threading
+import datetime
+
+try:
+    import psutil  # optional: CPU/RAM/Per-Process-Metriken
+except Exception:
+    psutil = None
+try:
+    import pynvml  # optional: NVIDIA GPU
+except Exception:
+    pynvml = None
 
 import requests
 
 # -----------------------------
-# Logging: only plain keywords INFO/WARNING/ERROR, single-sentence per row.
+# Logging: zeitgestempelt, Konsole + Datei, single-sentence pro Row.
 # -----------------------------
 logger = logging.getLogger("enricher")
 logger.setLevel(logging.INFO)
+
+# Konsole
 handler = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter("%(levelname)s %(message)s")
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+
+# Datei (Verzeichnis sicher anlegen)
+os.makedirs(os.path.dirname(DEFAULT_LOG_PATH), exist_ok=True)
+file_handler = logging.FileHandler(DEFAULT_LOG_PATH, mode="a", encoding="utf-8")
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# Doppellogging ins Root-Logger vermeiden
+logger.propagate = False
+
+# -----------------------------
+# Modell-Info von Ollama
+# -----------------------------
+def fetch_model_info(host: str, model: str) -> Dict[str, Any]:
+    """
+    Versucht, Modell-Parameter (inkl. num_ctx) via Ollama /api/show zu holen.
+    Rückgabe: dict mit möglichst vielen Feldern; leeres dict bei Fehler.
+    """
+    try:
+        url = f"{host.rstrip('/')}/api/show"
+        resp = requests.post(url, json={"name": model}, timeout=TIMEOUT_SEC)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        info = {
+            "family": data.get("model_info", {}).get("family"),
+            "format": data.get("model_info", {}).get("format"),
+            "quantization": data.get("model_info", {}).get("quantization"),
+            "parameter_size": data.get("model_info", {}).get("parameter_size"),
+            "digest": data.get("digest"),
+            "parameters_raw": data.get("parameters"),
+        }
+        # num_ctx extrahieren (falls als "num_ctx=XXXX" in parameters_raw)
+        num_ctx = None
+        params_raw = info.get("parameters_raw") or ""
+        for part in (params_raw or "").split():
+            if part.strip().startswith("num_ctx="):
+                try:
+                    num_ctx = int(part.split("=", 1)[1])
+                except Exception:
+                    pass
+        if num_ctx is not None:
+            info["num_ctx"] = num_ctx
+        return {k: v for k, v in info.items() if v is not None}
+    except Exception as e:
+        logger.warning(f"Konnte Modellinfos nicht abrufen (/api/show): {e}")
+        return {}
+
+# -----------------------------
+# Systemkonfiguration ins Log
+# -----------------------------
+def log_system_config() -> None:
+    """Loggt Basis-HW/SW-Infos (CPU, RAM, GPU wenn verfügbar)."""
+    try:
+        logger.info(f"System: {platform.system()} {platform.release()} ({platform.version()})")
+        logger.info(f"Python: {platform.python_version()} | Executable: {sys.executable}")
+        logger.info(f"Machine: {platform.machine()} | Processor: {platform.processor()}")
+        if psutil:
+            vm = psutil.virtual_memory()
+            logger.info(f"RAM total: {getattr(vm, 'total', 0):,} bytes")
+            logger.info(f"CPU logical cores: {psutil.cpu_count(logical=True)} | physical cores: {psutil.cpu_count(logical=False)}")
+        else:
+            logger.info("psutil nicht verfügbar – CPU/RAM-Details eingeschränkt.")
+        # NVIDIA GPU (optional)
+        if pynvml:
+            try:
+                pynvml.nvmlInit()
+                gpu_count = pynvml.nvmlDeviceGetCount()
+                for i in range(gpu_count):
+                    h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                    name = pynvml.nvmlDeviceGetName(h).decode("utf-8", errors="ignore")
+                    mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                    logger.info(f"GPU[{i}]: {name} | vRAM total: {mem.total:,} bytes")
+            finally:
+                try:
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
+        else:
+            logger.info("pynvml nicht verfügbar – GPU-Details (NVIDIA) eingeschränkt.")
+    except Exception as e:
+        logger.warning(f"Fehler beim Loggen der Systemkonfiguration: {e}")
+
+# -----------------------------
+# Performance-Monitor (Thread)
+# -----------------------------
+class PerformanceMonitor(threading.Thread):
+    """
+    Optionaler Monitoring-Thread: loggt regelmäßig CPU-, RAM- und (falls verfügbar) GPU-Last.
+    """
+    def __init__(self, interval_sec: float = 1.0):
+        super().__init__(daemon=True)
+        self.interval_sec = max(0.2, float(interval_sec))
+        self._stop = threading.Event()
+        self._gpu_handles = []
+        self._gpu_enabled = False
+        if pynvml:
+            try:
+                pynvml.nvmlInit()
+                for i in range(pynvml.nvmlDeviceGetCount()):
+                    self._gpu_handles.append(pynvml.nvmlDeviceGetHandleByIndex(i))
+                self._gpu_enabled = True
+            except Exception:
+                self._gpu_enabled = False
+
+        self._proc = psutil.Process(os.getpid()) if psutil else None
+        # Erste Messung "anstoßen", damit spätere cpu_percent Werte sinnvoll sind
+        if psutil:
+            psutil.cpu_percent(interval=None)
+            if self._proc:
+                self._proc.cpu_percent(interval=None)
+
+    def run(self):
+        try:
+            while not self._stop.is_set():
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if psutil:
+                    sys_cpu = psutil.cpu_percent(interval=None)
+                    sys_mem = psutil.virtual_memory().percent
+                    line = f"{ts} PERF system_cpu={sys_cpu:.1f}% system_ram={sys_mem:.1f}%"
+                    if self._proc:
+                        p_cpu = self._proc.cpu_percent(interval=None)
+                        p_mem = (self._proc.memory_info().rss / (1024 * 1024)) if self._proc else 0.0
+                        line += f" | proc_cpu={p_cpu:.1f}% proc_rss_mb={p_mem:.1f}"
+                else:
+                    line = f"{ts} PERF psutil_unavailable"
+
+                if self._gpu_enabled:
+                    try:
+                        parts = []
+                        for idx, h in enumerate(self._gpu_handles):
+                            util = pynvml.nvmlDeviceGetUtilizationRates(h)
+                            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                            parts.append(
+                                f"GPU{idx}_util={util.gpu}% GPU{idx}_mem_util={util.memory}% GPU{idx}_vram_used_mb={mem.used//(1024*1024)}"
+                            )
+                        line += " | " + " ".join(parts)
+                    except Exception:
+                        line += " | gpu_read_error"
+
+                logger.info(line)
+                if self._stop.wait(self.interval_sec):
+                    break
+        finally:
+            if self._gpu_enabled:
+                try:
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
+
+    def stop(self):
+        self._stop.set()
 
 # -----------------------------
 # Input loader: supports flat list or nested Excel-export structure.
@@ -108,10 +258,10 @@ def load_rows_from_json(json_path: Path) -> Tuple[List[Dict[str, Any]], Optional
         original_data = json.loads(json_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         logger.error(f"Input file not found: {json_path}")
-        sys.exit(1)
+        raise
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in input file: {e}")
-        sys.exit(1)
+        raise
 
     rows: List[Dict[str, Any]] = []
     headers: Optional[List[str]] = None
@@ -120,7 +270,7 @@ def load_rows_from_json(json_path: Path) -> Tuple[List[Dict[str, Any]], Optional
     if isinstance(original_data, list):
         if original_data and isinstance(original_data[0], dict):
             rows = original_data
-            headers = list(rows[0].keys()) # Preserve original header order
+            headers = list(rows[0].keys())  # Preserve original header order
             return rows, headers, original_data
         raise ValueError("JSON list found, but does not contain objects.")
 
@@ -132,7 +282,7 @@ def load_rows_from_json(json_path: Path) -> Tuple[List[Dict[str, Any]], Optional
     if sheets:
         if len(sheets) > 1:
             logger.warning(f"Found {len(sheets)} sheets; only processing the first one.")
-        
+
         first_sheet = next(iter(sheets.values()), None)
         if not first_sheet:
             raise ValueError("Found 'sheets' but it is empty.")
@@ -140,18 +290,18 @@ def load_rows_from_json(json_path: Path) -> Tuple[List[Dict[str, Any]], Optional
         tables = first_sheet.get("excel_tables", [])
         if not tables:
             raise ValueError("Missing 'excel_tables' in first sheet.")
-        
+
         table0 = tables[0]
         rows = table0.get("rows", [])
         headers = table0.get("headers", None)
-        
+
         if not isinstance(rows, list) or not rows:
             raise ValueError("No rows found in 'rows'.")
-        
+
         # Fallback to infer headers from the first row if not explicitly provided
         if headers is None and isinstance(rows[0], dict):
             headers = list(rows[0].keys())
-        
+
         return rows, headers, original_data
 
     raise ValueError("Cannot detect supported structure (no list and no 'sheets').")
@@ -257,39 +407,33 @@ def _parse_flexible_answer(raw_answer: Optional[str], valid_labels: Tuple[str, .
     """Finds the first valid label in a raw string, case-insensitive."""
     if not raw_answer:
         return None
-    
-    # First, try for an exact match (most common case)
     if raw_answer in valid_labels:
         return raw_answer
-        
-    # If no exact match, search for the label within the string
     lower_answer = raw_answer.lower()
     for label in valid_labels:
         if label.lower() in lower_answer:
-            return label # Return the original, correctly-cased label
+            return label  # original casing
     return None
 
 def _ask_and_validate_question(
-    prompt_func, *args, 
+    prompt_func, *args,
     valid_labels: Optional[Tuple[str, ...]] = None,
     is_summary: bool = False
 ) -> Tuple[str, bool]:
     """Helper to ask a question, parse the answer, and return value and validity."""
     question_text = prompt_func(*args)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": question_text}]
-    
     raw_answer = call_ollama_chat(
         model=cli_args.model, messages=messages, host=cli_args.host,
         temperature=cli_args.temperature, num_predict=cli_args.num_predict, timeout=cli_args.timeout
     )
 
-    if raw_answer is None: # API call failed
+    if raw_answer is None:  # API call failed
         return "", False
 
     if is_summary:
         return raw_answer, bool(raw_answer)
 
-    # For classification questions, parse flexibly
     parsed_answer = _parse_flexible_answer(raw_answer, valid_labels)
     if parsed_answer:
         return parsed_answer, True
@@ -301,7 +445,7 @@ def _ask_and_validate_question(
 # Main processing
 # -----------------------------
 
-cli_args: argparse.Namespace = None # Global placeholder for command-line arguments
+cli_args: argparse.Namespace = None  # Global placeholder for command-line arguments
 
 def main() -> None:
     global cli_args
@@ -316,48 +460,95 @@ def main() -> None:
     ap.add_argument("--delay", type=float, default=REQUEST_DELAY_SEC, help="Optional delay between processed rows")
     cli_args = ap.parse_args()
 
+    t0 = time.perf_counter()
+
+    # Modell- und Laufkonfiguration loggen
+    logger.info(f"Run started | input='{cli_args.input}' | output='{cli_args.out}'")
+    logger.info(f"Model: {cli_args.model} | Host: {cli_args.host} | temperature={cli_args.temperature} | num_predict={cli_args.num_predict} | timeout={cli_args.timeout} | delay={cli_args.delay}")
+    model_info = fetch_model_info(cli_args.host, cli_args.model)
+    if model_info:
+        logger.info("Model info: " + ", ".join(f"{k}={v}" for k, v in model_info.items()))
+    else:
+        logger.info("Model info: (not available)")
+
+    # Systemkonfiguration loggen
+    log_system_config()
+
+    # Performance-Monitor starten
+    perf_mon = PerformanceMonitor(interval_sec=PERF_SAMPLING_SEC)
+    perf_mon.start()
+
+    # --- Daten laden
     try:
         rows, headers, original_data = load_rows_from_json(cli_args.input)
-    except ValueError as e:
+    except Exception as e:
         logger.error(f"Failed to load or parse input file: {e}")
+        try:
+            perf_mon.stop()
+            perf_mon.join(timeout=3.0)
+        except Exception:
+            pass
         sys.exit(1)
 
     logger.info(f"Loaded {len(rows)} rows to process.")
     enriched_rows: List[Dict[str, Any]] = []
 
-    for idx, row in enumerate(rows, start=1):
-        row_json = json.dumps(row, ensure_ascii=False, indent=2)
+    # --- Verarbeitung
+    try:
+        for idx, row in enumerate(rows, start=1):
+            row_t0 = time.perf_counter()
+            logger.info(f"Row {idx} start")
+            row_json = json.dumps(row, ensure_ascii=False, indent=2)
 
-        ans_breakage, valid_breakage = _ask_and_validate_question(prompt_yesno_breakage, row_json, valid_labels=STRICT_YESNO)
-        ans_ceramic, valid_ceramic = _ask_and_validate_question(prompt_yesno_ceramic, row_json, valid_labels=STRICT_YESNO)
-        ans_detected, valid_detected = _ask_and_validate_question(prompt_detected_when, row_json, valid_labels=DETECTED_LABELS)
-        ans_harm, valid_harm = _ask_and_validate_question(prompt_patient_harm, row_json, valid_labels=PATIENT_HARM_LABELS)
-        
-        # Pass the (potentially invalid) answers to summary to give it context
-        summary_text, valid_summary = _ask_and_validate_question(
-            prompt_summary, row_json, ans_breakage, ans_ceramic, ans_detected, ans_harm, is_summary=True
-        )
+            ans_breakage, valid_breakage = _ask_and_validate_question(prompt_yesno_breakage, row_json, valid_labels=STRICT_YESNO)
+            ans_ceramic, valid_ceramic = _ask_and_validate_question(prompt_yesno_ceramic, row_json, valid_labels=STRICT_YESNO)
+            ans_detected, valid_detected = _ask_and_validate_question(prompt_detected_when, row_json, valid_labels=DETECTED_LABELS)
+            ans_harm, valid_harm = _ask_and_validate_question(prompt_patient_harm, row_json, valid_labels=PATIENT_HARM_LABELS)
 
-        out_row = dict(row)
-        out_row["Issue related to breakage?"] = ans_breakage if valid_breakage else ""
-        out_row["Issue related to ceramic tip?"] = ans_ceramic if valid_ceramic else ""
-        out_row["When was the issue detected?"] = ans_detected if valid_detected else ""
-        out_row["Type of Patient-Harm?"] = ans_harm if valid_harm else ""
-        out_row["Summary"] = summary_text if valid_summary else ""
-        enriched_rows.append(out_row)
+            # Pass (even invalid) answers to summary to give it context
+            summary_text, valid_summary = _ask_and_validate_question(
+                prompt_summary, row_json, ans_breakage, ans_ceramic, ans_detected, ans_harm, is_summary=True
+            )
 
-        status_parts = [
-            f"breakage={'ok' if valid_breakage else 'fail'}",
-            f"ceramic={'ok' if valid_ceramic else 'fail'}",
-            f"detected={'ok' if valid_detected else 'fail'}",
-            f"harm={'ok' if valid_harm else 'fail'}",
-            f"summary={'ok' if valid_summary else 'fail'}",
-        ]
-        all_valid = all([valid_breakage, valid_ceramic, valid_detected, valid_harm, valid_summary])
-        logger.log(logging.INFO if all_valid else logging.WARNING, f"Row {idx}: " + ", ".join(status_parts))
+            out_row = dict(row)
+            out_row["Issue related to breakage?"] = ans_breakage if valid_breakage else ""
+            out_row["Issue related to ceramic tip?"] = ans_ceramic if valid_ceramic else ""
+            out_row["When was the issue detected?"] = ans_detected if valid_detected else ""
+            out_row["Type of Patient-Harm?"] = ans_harm if valid_harm else ""
+            out_row["Summary"] = summary_text if valid_summary else ""
+            enriched_rows.append(out_row)
 
-        if cli_args.delay > 0:
-            time.sleep(cli_args.delay)
+            status_parts = [
+                f"breakage={ans_breakage if valid_breakage else 'fail'}",
+                f"ceramic={ans_ceramic if valid_ceramic else 'fail'}",
+                f"detected={ans_detected if valid_detected else 'fail'}",
+                f"harm={ans_harm if valid_harm else 'fail'}",
+                f"summary={'ok' if valid_summary else 'fail'}",
+            ]
+            all_valid = all([valid_breakage, valid_ceramic, valid_detected, valid_harm, valid_summary])
+            logger.log(logging.INFO if all_valid else logging.WARNING, f"Row {idx}: " + ", ".join(status_parts))
+
+            row_dt = time.perf_counter() - row_t0
+            logger.info(f"Row {idx} end | duration_sec={row_dt:.3f}")
+
+            if cli_args.delay > 0:
+                time.sleep(cli_args.delay)
+    except KeyboardInterrupt:
+        logger.warning("Aborted by user during row processing")
+        try:
+            perf_mon.stop()
+            perf_mon.join(timeout=3.0)
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during processing: {e}")
+        try:
+            perf_mon.stop()
+            perf_mon.join(timeout=3.0)
+        except Exception:
+            pass
+        sys.exit(1)
 
     # --- Preserve original outer structure and write output ---
     output_obj: Any
@@ -365,7 +556,7 @@ def main() -> None:
         output_obj = original_data
         first_sheet_key = next(iter(output_obj["sheets"].keys()))
         table0 = output_obj["sheets"][first_sheet_key]["excel_tables"][0]
-        
+
         headers_list = table0.get("headers") or (list(headers) if headers else [])
         for col in NEW_COLUMNS:
             if col not in headers_list:
@@ -378,7 +569,7 @@ def main() -> None:
         final_headers = (headers or []) + [col for col in NEW_COLUMNS if col not in (headers or [])]
         output_obj = [reorder_row(r, final_headers) for r in enriched_rows]
     else:
-        output_obj = enriched_rows # Fallback
+        output_obj = enriched_rows  # Fallback
 
     try:
         Path(cli_args.out).write_text(
@@ -386,8 +577,22 @@ def main() -> None:
             encoding="utf-8",
         )
         logger.info(f"Wrote output with preserved structure to {cli_args.out}")
+        # Performance-Monitor stoppen
+        try:
+            perf_mon.stop()
+            perf_mon.join(timeout=3.0)
+        except Exception:
+            pass
+
+        dt = time.perf_counter() - t0
+        logger.info(f"Run finished | total_duration_sec={dt:.3f}")
     except Exception as e:
         logger.error(f"Failed to write output file: {e}")
+        try:
+            perf_mon.stop()
+            perf_mon.join(timeout=3.0)
+        except Exception:
+            pass
         sys.exit(1)
 
 if __name__ == "__main__":
